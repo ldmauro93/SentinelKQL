@@ -1,0 +1,33 @@
+// Storm analytic for all clients
+
+let suspiciousUserClicks = materialize(UrlClickEvents
+    | where ActionType in ("ClickAllowed", "UrlScanInProgress", "UrlErrorPage") or IsClickedThrough != "0"
+    | where UrlChain has_any ("microsoft.com/devicelogin", "login.microsoftonline.com/common/oauth2/deviceauth")
+    | extend AccountUpn = tolower(AccountUpn)
+    | project ClickTime = Timestamp, ActionType, UrlChain, NetworkMessageId, Url, AccountUpn);
+//Check for Risky Sign-In in the short time window
+let interestedUsersUpn = suspiciousUserClicks
+    | where isnotempty(AccountUpn)
+    | distinct AccountUpn;
+let suspiciousSignIns = materialize(SigninLogs
+    | where ResultType == 0
+    | where UserPrincipalName in~ (interestedUsersUpn)
+    | where RiskLevelDuringSignIn in ("low", "medium", "high")
+    | extend AccountUpn = tolower(UserPrincipalName)
+    | join kind=inner suspiciousUserClicks on AccountUpn
+    | where (TimeGenerated - ClickTime) between (-2min .. 7min)
+    | project TimeGenerated, CorrelationId, ClickTime, AccountUpn, RiskLevelDuringSignIn, UserAgent, IPAddress, Url
+);
+//Validate errorCode 50199 followed by success in 5 minute time interval for the interested user, which suggests a pause to input the code from the phishing email
+let interestedSessionUsers = suspiciousSignIns
+    | where isnotempty(AccountUpn)
+    | distinct AccountUpn;
+let shortIntervalSignInAttemptUsers = materialize(SigninLogs
+    | where UserPrincipalName in~ (interestedSessionUsers)
+    | extend AccountUpn = tolower(UserPrincipalName)
+    | where ResultType in (0, 50199)
+    | summarize ErrorCodes = make_set(ResultType) by AccountUpn, CorrelationId
+    | where ErrorCodes has_all (0, 50199)
+    | distinct AccountUpn);
+suspiciousSignIns
+| where AccountUpn in (shortIntervalSignInAttemptUsers)
